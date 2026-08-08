@@ -70,5 +70,6 @@ If you use RAVEN in academic work, please cite the corresponding manuscript:
 
 > **RAVEN: Frozen Random Graph Reservoirs with Physics-Informed Interaction Fingerprints for Protein–Ligand Binding Affinity Prediction**
 
-Qingyang Zou, Jiaye Huang, Hangbo Xie, Jiayue Yin, and Jinfeng Liu  
-China Pharmaceutical University
+邹青杨、黄嘉烨、谢瀚博、殷嘉悦
+通讯作者：刘金峰
+中国药科大学
