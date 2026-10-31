@@ -1,0 +1,34 @@
+RAVEN_Revision_SharedAdapter_32H_1024 verification
+
+Model contract:
+- 32 ordinary frozen random encoders
+- 1 dedicated global frozen encoder
+- 3 R-MLP experts
+- 3 J-MLP experts
+- 3 ExtraTrees experts
+- final prediction uses one validation-fitted nonnegative softmax fusion over all 9 experts
+- no best-single or greedy-mean final selection
+
+Revision controls:
+- ordinary structure/interaction adapter shared across all 32 ordinary heads within each neural expert
+- ordinary ligand adapter shared across all 32 ordinary heads within each neural expert
+- global branch uses a dedicated adapter
+- R-MLP and J-MLP keep separate adapter parameters
+- fusion hidden dimensions: 1024 -> 256 -> 128
+- ExtraTrees settings unchanged
+
+Dimensions and trainable parameters:
+- raw structural reservoir: 37632D
+- adapted R-MLP input: 12544D
+- adapted J-MLP input: 12800D including 256D physics adapter output
+- R-MLP trainable parameters: 14329794
+- J-MLP trainable parameters: 15664834
+
+Evaluation units:
+- raw training labels remain deltaG_kcal_mol
+- pK conversion factor: 0.7330050866 pK per kcal/mol, with sign inversion for values
+- final prediction CSVs export target_pK, prediction_pK, residual_pK
+- RMSE/MAE/bias are reported in pK
+- Pearson/Spearman/R2 are invariant under the common linear unit conversion
+
+Static Python compilation and synthetic R-MLP/J-MLP forward checks passed before packaging.

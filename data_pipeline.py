@@ -262,3 +262,42 @@ def iter_split_batches(
                 complex_ids=ids,
             )
         del graphs
+
+# Load the protected CASF-2016 manifest.
+def load_casf_manifest(root: str) -> List[Dict[str, str]]:
+    return read_csv_rows(Path(root) / "CASF2016_manifest.csv")
+
+
+# Iterate protected CASF-2016 batches.
+def iter_casf_batches(
+    root: str,
+    batch_size: int,
+    split_name: str = "CASF2016",
+) -> Iterator[TensorBatch]:
+    rows = load_casf_manifest(root)
+    graph_cache: Dict[str, Sequence[Any]] = {}
+    for row in rows:
+        relpath = str(row["graph_chunk_relpath"]).strip()
+        if relpath not in graph_cache:
+            graphs, _ = dgl.load_graphs(str(Path(root) / relpath))
+            graph_cache[relpath] = graphs
+
+    for start in range(0, len(rows), int(batch_size)):
+        selected = rows[start : start + int(batch_size)]
+        graphs: List[Any] = []
+        labels: List[float] = []
+        ids: List[str] = []
+        for row in selected:
+            relpath = str(row["graph_chunk_relpath"]).strip()
+            offset = int(row["hetero_graph_offset"])
+            graphs.append(graph_cache[relpath][offset])
+            labels.append(float(row["deltaG_kcal_mol"]))
+            ids.append(str(row["complex_id"]))
+        yield collate_existing_pairs(
+            graphs,
+            source=f"{split_name}:{start}",
+            labels=labels,
+            complex_ids=ids,
+        )
+    graph_cache.clear()
+

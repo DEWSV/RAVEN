@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 
-PACKAGE_RELEASE = "RAVEN"
+PACKAGE_RELEASE = "RAVEN_Revision_SharedAdapter_32H_1024"
 
 
 @dataclass
 class RunConfig:
     pdbbind_root: str = "/usr/share/ollama/.ollama/zqydisk/Finals/data_bank/PL-heterograph-PDBbind-PhysGates"
+    casf_root: str = "/usr/share/ollama/.ollama/zqydisk/Finals/data_bank/PL-heterograph-CASF2016-PhysGates"
     output_root: str = str(Path(__file__).resolve().parent / "output")
 
     device: str = "cuda"
@@ -83,7 +84,7 @@ class RunConfig:
     physics_adapter_output: int = 256
     adapter_dropouts: Tuple[float, float] = (0.15, 0.10)
 
-    fusion_hidden_dims: Tuple[int, ...] = (2048, 512, 128)
+    fusion_hidden_dims: Tuple[int, ...] = (1024, 256, 128)
     fusion_dropouts: Tuple[float, ...] = (0.35, 0.30, 0.25)
     branch_dropout_probability: float = 0.08
     feature_noise_std: float = 0.008
@@ -158,6 +159,10 @@ class RunConfig:
     def final_metrics_json(self) -> Path:
         return Path(self.output_root) / "final_metrics.json"
 
+    @property
+    def casf_predictions_csv(self) -> Path:
+        return Path(self.output_root) / "casf2016_predictions_final.csv"
+
     # Resolve config-output path.
     @property
     def resolved_config_json(self) -> Path:
@@ -175,6 +180,10 @@ class RunConfig:
             "encoding_storage": "RAM only; no encoded vector files are written",
             "selection_contract": "Val selects neural checkpoints and learns final softmax weights; Test is encoded afterwards",
             "encoder_contract": "thirty-two dual-output frozen random encoders plus one frozen random protein+ligand branch",
+            "adapter_contract": "ordinary structure adapters are shared across all ordinary heads within each neural expert; ordinary ligand adapters are likewise shared; the global branch uses a dedicated adapter; R-MLP and J-MLP do not share adapters",
+            "fusion_contract": "all neural experts use a fixed 1024-256-128 fusion head",
+            "evaluation_unit": "dimensionless pK; raw training labels remain deltaG_kcal_mol",
+            "pk_per_kcal_mol": 0.7330050866,
         })
         return value
 

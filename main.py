@@ -16,10 +16,17 @@ from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from config import CONFIG, PACKAGE_RELEASE, RunConfig
-from data_pipeline import ChunkRecord, discover_pdbbind_chunks, iter_split_batches
+from data_pipeline import ChunkRecord, discover_pdbbind_chunks, iter_casf_batches, iter_split_batches, load_casf_manifest
 from encoder import RandomComplexEncoder
 from physics_fingerprint import build_physics_fingerprint
 from regressors import JointRegressor, ReservoirRegressor
+
+
+PK_PER_KCAL_MOL = 0.7330050866
+
+
+def delta_g_to_pk(value: torch.Tensor) -> torch.Tensor:
+    return -value.float() * PK_PER_KCAL_MOL
 
 
 # Set random seeds.
@@ -48,8 +55,8 @@ def pearson_tensor(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tens
 
 # Compute regression metrics.
 def regression_metrics(prediction: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
-    prediction = prediction.float().view(-1).cpu()
-    target = target.float().view(-1).cpu()
+    prediction = delta_g_to_pk(prediction).view(-1).cpu()
+    target = delta_g_to_pk(target).view(-1).cpu()
     residual = prediction - target
     centered = target - target.mean()
     spearman = float(np.corrcoef(rankdata(prediction.numpy()), rankdata(target.numpy()))[0, 1])
@@ -309,7 +316,7 @@ def train_neural_head(
             loss=f"{row['loss']:.4f}",
             lr=f"{row['lr']:.1e}",
             r=f"{metrics['pearson']:.4f}",
-            rmse=f"{metrics['rmse']:.3f}",
+            rmse_pK=f"{metrics['rmse']:.3f}",
         )
         progress.update(1)
         if patience >= cfg.early_stop_patience:
@@ -361,7 +368,7 @@ def fit_extra_trees(
         metrics.append(value)
         print(
             f"ExtraTrees seed={seed}: Val r={value['pearson']:.4f} "
-            f"rho={value['spearman']:.4f} RMSE={value['rmse']:.3f}",
+            f"rho={value['spearman']:.4f} RMSE_pK={value['rmse']:.3f}",
             flush=True,
         )
     return models, predictions, metrics
@@ -393,10 +400,12 @@ def weighted_ensemble(
 # Save final predictions.
 def save_predictions(path: Path, complex_ids: Sequence[str], target: torch.Tensor, prediction: torch.Tensor) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    target_pk = delta_g_to_pk(target).view(-1).cpu()
+    prediction_pk = delta_g_to_pk(prediction).view(-1).cpu()
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("complex_id", "target", "prediction", "residual"))
-        for complex_id, true_value, predicted_value in zip(complex_ids, target.tolist(), prediction.tolist()):
+        writer.writerow(("complex_id", "target_pK", "prediction_pK", "residual_pK"))
+        for complex_id, true_value, predicted_value in zip(complex_ids, target_pk.tolist(), prediction_pk.tolist()):
             writer.writerow((
                 complex_id,
                 f"{true_value:.8f}",
@@ -451,6 +460,9 @@ def main() -> None:
     print(f"Reservoir branches   : {len(branch_names)}", flush=True)
     print(f"Branch order         : {branch_names}", flush=True)
     print(f"Reservoir dimensions : {cfg.reservoir_feature_dim}D", flush=True)
+    print("Ordinary adapters    : shared within each neural expert", flush=True)
+    print("Global adapter       : dedicated within each neural expert", flush=True)
+    print(f"Fusion hidden dims   : {cfg.fusion_hidden_dims}", flush=True)
     print("Physics fingerprint  : raw node/edge/cross-distance/phys-gate statistics", flush=True)
     print("Encoded vectors      : RAM only; no feature files are written", flush=True)
     print(f"Chunks               : Train={len(train_records)}, Val={len(val_records)}, Test={len(test_records)}", flush=True)
@@ -583,6 +595,65 @@ def main() -> None:
     test_metrics = regression_metrics(test_final_prediction, test_y_raw)
     save_predictions(cfg.test_predictions_csv, test_ids, test_y_raw, test_final_prediction)
 
+    casf_rows = load_casf_manifest(cfg.casf_root)
+    encoders, _ = make_encoder_bank(cfg, device)
+    total_casf = len(casf_rows)
+    reservoir_parts: List[torch.Tensor] = []
+    physics_parts: List[torch.Tensor] = []
+    label_parts: List[torch.Tensor] = []
+    casf_ids = []
+    progress = tqdm(total=total_casf, desc="CASF2016 reservoir+physics encoding", unit="graph", dynamic_ncols=True, mininterval=0.25)
+    with torch.inference_mode():
+        for batch in iter_casf_batches(cfg.casf_root, cfg.graph_batch_size, "CASF2016"):
+            physics_parts.append(build_physics_fingerprint(batch).cpu())
+            if cfg.pin_memory and torch.cuda.is_available():
+                batch.pin_memory_()
+            batch = batch.to(device, non_blocking=cfg.pin_memory)
+            branches: List[torch.Tensor] = []
+            for index, encoder in enumerate(encoders):
+                output = encoder(batch)
+                if index < cfg.random_count:
+                    branches.append(torch.cat((output["protein_pool"], output["interaction_pool"]), dim=-1).float())
+                    branches.append(output["ligand_pool"].float())
+                else:
+                    branches.append(torch.cat((output["protein_pool"], output["ligand_pool"]), dim=-1).float())
+            reservoir_parts.append(torch.cat(branches, dim=-1).cpu())
+            label_parts.append(batch.labels.float().cpu())
+            casf_ids.extend(batch.complex_ids)
+            progress.update(batch.num_graphs)
+    progress.close()
+    del encoders
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    casf_r_raw = torch.cat(reservoir_parts)
+    casf_p_raw = torch.cat(physics_parts)
+    casf_y_raw = torch.cat(label_parts)
+    casf_r = (casf_r_raw - reservoir_mean) / reservoir_std
+    casf_p = (casf_p_raw - physics_mean) / physics_std
+
+    casf_candidate_predictions: List[torch.Tensor] = []
+    for family, model in candidate_models:
+        if family == "reservoir":
+            neural = model.to(device)
+            prediction = predict_reservoir(
+                neural, casf_r, cfg.eval_batch_size, device, target_mean, target_std
+            )
+            neural.cpu()
+        elif family == "joint":
+            neural = model.to(device)
+            prediction = predict_joint(
+                neural, casf_r, casf_p, cfg.eval_batch_size, device, target_mean, target_std
+            )
+            neural.cpu()
+        else:
+            prediction = torch.from_numpy(model.predict(casf_p_raw.numpy())).float()
+        casf_candidate_predictions.append(prediction)
+
+    casf_matrix = torch.stack(casf_candidate_predictions, dim=1)
+    casf_final_prediction = casf_matrix @ weighted_weights
+    casf_metrics = regression_metrics(casf_final_prediction, casf_y_raw)
+    save_predictions(cfg.casf_predictions_csv, casf_ids, casf_y_raw, casf_final_prediction)
+
     elapsed = time.perf_counter() - start_time
     payload = {
         "package_release": PACKAGE_RELEASE,
@@ -597,9 +668,11 @@ def main() -> None:
         "weighted_weights": weighted_weights.tolist(),
         "val_final_metrics": val_final_metrics,
         "test_metrics": test_metrics,
+        "casf2016_metrics": casf_metrics,
         "train_graphs": len(train_ids),
         "val_graphs": len(val_ids),
         "test_graphs": len(test_ids),
+        "casf2016_graphs": len(casf_ids),
         "encoded_vectors_saved": False,
         "elapsed_minutes": elapsed / 60.0,
     }
@@ -609,14 +682,21 @@ def main() -> None:
         "VAL FINAL : "
         f"mode={ensemble_mode} r={val_final_metrics['pearson']:.4f} "
         f"rho={val_final_metrics['spearman']:.4f} "
-        f"RMSE={val_final_metrics['rmse']:.3f} MAE={val_final_metrics['mae']:.3f}",
+        f"RMSE_pK={val_final_metrics['rmse']:.3f} MAE_pK={val_final_metrics['mae']:.3f}",
         flush=True,
     )
     print(
         "TEST FINAL: "
         f"r={test_metrics['pearson']:.4f} rho={test_metrics['spearman']:.4f} "
-        f"RMSE={test_metrics['rmse']:.3f} MAE={test_metrics['mae']:.3f} "
+        f"RMSE_pK={test_metrics['rmse']:.3f} MAE_pK={test_metrics['mae']:.3f} "
         f"R2={test_metrics['r2']:.4f}",
+        flush=True,
+    )
+    print(
+        "CASF FINAL: "
+        f"r={casf_metrics['pearson']:.4f} rho={casf_metrics['spearman']:.4f} "
+        f"RMSE_pK={casf_metrics['rmse']:.3f} MAE_pK={casf_metrics['mae']:.3f} "
+        f"R2={casf_metrics['r2']:.4f}",
         flush=True,
     )
     print(f"Runtime   : {elapsed / 60.0:.1f} min", flush=True)

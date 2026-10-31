@@ -1,0 +1,2 @@
+RAVEN_Revision_SharedAdapter_32H_1024
+32 ordinary frozen heads + 1 global branch; shared ordinary adapters; 1024-256-128 neural fusion; fixed nine-expert validation-softmax ensemble; pK reporting.

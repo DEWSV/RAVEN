@@ -55,37 +55,28 @@ class ReservoirRegressor(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.branch_dims = tuple(int(value) for value in cfg.reservoir_branch_dims)
-        adapters: List[nn.Module] = []
-        output_dims: List[int] = []
-        for index, input_dim in enumerate(self.branch_dims):
-            is_extra_random = index == len(self.branch_dims) - 1
-            is_ligand = (index % 2 == 1) and not is_extra_random
-            if is_ligand:
-                adapters.append(Adapter(
-                    input_dim,
-                    cfg.ligand_adapter_hidden,
-                    cfg.ligand_adapter_output,
-                    cfg.adapter_dropouts,
-                ))
-                output_dims.append(cfg.ligand_adapter_output)
-            elif is_extra_random:
-                adapters.append(Adapter(
-                    input_dim,
-                    cfg.extra_random_adapter_hidden,
-                    cfg.extra_random_adapter_output,
-                    cfg.adapter_dropouts,
-                ))
-                output_dims.append(cfg.extra_random_adapter_output)
-            else:
-                adapters.append(Adapter(
-                    input_dim,
-                    cfg.structure_adapter_hidden,
-                    cfg.structure_adapter_output,
-                    cfg.adapter_dropouts,
-                ))
-                output_dims.append(cfg.structure_adapter_output)
-        self.adapters = nn.ModuleList(adapters)
-        self.output_dims = tuple(int(value) for value in output_dims)
+        self.ordinary_structure_adapter = Adapter(
+            cfg.random_structure_dim,
+            cfg.structure_adapter_hidden,
+            cfg.structure_adapter_output,
+            cfg.adapter_dropouts,
+        )
+        self.ordinary_ligand_adapter = Adapter(
+            cfg.random_ligand_dim,
+            cfg.ligand_adapter_hidden,
+            cfg.ligand_adapter_output,
+            cfg.adapter_dropouts,
+        )
+        self.global_adapter = Adapter(
+            cfg.extra_random_global_dim,
+            cfg.extra_random_adapter_hidden,
+            cfg.extra_random_adapter_output,
+            cfg.adapter_dropouts,
+        )
+        self.output_dims = tuple(
+            [cfg.structure_adapter_output, cfg.ligand_adapter_output] * cfg.random_count
+            + [cfg.extra_random_adapter_output]
+        )
         self.branch_logits = nn.Parameter(torch.zeros(len(self.branch_dims)))
         self.fusion = FusionHead(sum(self.output_dims), cfg)
 
@@ -98,9 +89,16 @@ class ReservoirRegressor(nn.Module):
         weights = self.branch_weights() * float(len(self.branch_dims))
         parts: List[torch.Tensor] = []
         offset = 0
-        for index, (input_dim, adapter) in enumerate(zip(self.branch_dims, self.adapters)):
+        last_index = len(self.branch_dims) - 1
+        for index, input_dim in enumerate(self.branch_dims):
             branch = value[:, offset : offset + input_dim]
             offset += input_dim
+            if index == last_index:
+                adapter = self.global_adapter
+            elif index % 2 == 1:
+                adapter = self.ordinary_ligand_adapter
+            else:
+                adapter = self.ordinary_structure_adapter
             branch = adapter(branch) * weights[index]
             if self.training and self.cfg.branch_dropout_probability > 0.0:
                 keep = (
